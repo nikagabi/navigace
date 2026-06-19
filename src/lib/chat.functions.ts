@@ -1,0 +1,248 @@
+import { createServerFn } from '@tanstack/react-start';
+import { z } from 'zod';
+import { requireSupabaseAuth } from '../integrations/supabase/auth-middleware';
+import { embedText, chatComplete } from './ai-gateway.server';
+import type { ChunkMatch } from '../integrations/supabase/types';
+
+const SYSTEM_PROMPT = `Jsi Navigace — interní HR asistent firmy.
+
+PRAVIDLA:
+1. Odpovídej VÝHRADNĚ z poskytnutého kontextu z firemních dokumentů.
+2. Pokud odpověď není v kontextu, řekni: "Tuto informaci v dostupných dokumentech nenacházím."
+3. Nikdy nevymýšlej fakta, čísla, data ani postupy.
+4. Odpovídej stručně a věcně v češtině.
+5. Vždy uveď, z jakého dokumentu čerpáš (dostaneš je v kontextu).
+6. Pokud je dotaz nesrozumitelný, požádej o upřesnění.
+
+FORMÁT:
+- Používej markdown (tučné písmo, seznamy) pro přehlednost.
+- Citace zdrojů jsou automaticky doplněny systémem, neuvádí je v textu odpovědi.`;
+
+function buildContextPrompt(chunks: ChunkMatch[]): string {
+  if (chunks.length === 0) {
+    return '\n\n[KONTEXT: Žádné relevantní dokumenty nenalezeny.]';
+  }
+
+  const contextParts = chunks.map(
+    (c, i) =>
+      `[Zdroj ${i + 1}: ${c.document_title}, část ${c.chunk_index + 1}]\n${c.content}`
+  );
+
+  return `\n\nKONTEXT Z FIREMNÍCH DOKUMENTŮ:\n${contextParts.join('\n\n---\n\n')}`;
+}
+
+const AskInput = z.object({
+  conversationId: z.string().uuid(),
+  message: z.string().min(1).max(2000),
+});
+
+export const askAssistant = createServerFn({ method: 'POST' })
+  .middleware([requireSupabaseAuth])
+  .validator(AskInput)
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const userId = context.user.id;
+
+    const { data: conv, error: convErr } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('id', data.conversationId)
+      .eq('user_id', userId)
+      .single();
+
+    if (convErr || !conv) {
+      throw new Error('Konverzace nenalezena nebo nemáte přístup.');
+    }
+
+    await supabase.from('messages').insert({
+      conversation_id: data.conversationId,
+      role: 'user',
+      content: data.message,
+    });
+
+    let queryEmbedding: number[];
+    try {
+      queryEmbedding = await embedText(data.message);
+    } catch {
+      throw new Error('Vektorové vyhledávání momentálně nedostupné.');
+    }
+
+    const { data: chunks } = await supabase.rpc('match_chunks', {
+      query_embedding: `[${queryEmbedding.join(',')}]`,
+      match_count: 5,
+      similarity_threshold: 0.3,
+    });
+
+    const { data: history } = await supabase
+      .from('messages')
+      .select('role, content')
+      .eq('conversation_id', data.conversationId)
+      .order('created_at', { ascending: true })
+      .limit(20);
+
+    const contextStr = buildContextPrompt(chunks ?? []);
+    const fullSystem = SYSTEM_PROMPT + contextStr;
+
+    let aiResponse: string;
+    try {
+      aiResponse = await chatComplete(
+        fullSystem,
+        (history ?? []).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+      );
+    } catch (err: any) {
+      if (err.message === 'TOO_MANY_REQUESTS') {
+        throw new Error('Příliš mnoho požadavků. Zkuste to za chvíli.');
+      }
+      if (err.message === 'CREDIT_EXHAUSTED') {
+        throw new Error('Kredit AI asistenta byl vyčerpán. Kontaktujte administrátora.');
+      }
+      throw new Error('AI asistent momentálně nedostupný.');
+    }
+
+    const sources = (chunks ?? []).map((c: ChunkMatch) => ({
+      document_id: c.document_id,
+      title: c.document_title,
+      chunk_index: c.chunk_index,
+      similarity: Math.round(c.similarity * 100),
+    }));
+
+    const { data: savedMsg } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id: data.conversationId,
+        role: 'assistant',
+        content: aiResponse,
+        sources,
+      })
+      .select()
+      .single();
+
+    const msgCount = history?.length ?? 0;
+    if (msgCount <= 1) {
+      const title = data.message.length > 50
+        ? data.message.slice(0, 50) + '…'
+        : data.message;
+      await supabase
+        .from('conversations')
+        .update({ title })
+        .eq('id', data.conversationId);
+    }
+
+    return { message: savedMsg, sources };
+  });
+
+export const listConversations = createServerFn({ method: 'GET' })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data } = await context.supabase
+      .from('conversations')
+      .select('*')
+      .eq('user_id', context.user.id)
+      .order('updated_at', { ascending: false });
+    return data ?? [];
+  });
+
+export const createConversation = createServerFn({ method: 'POST' })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data, error } = await context.supabase
+      .from('conversations')
+      .insert({ user_id: context.user.id })
+      .select()
+      .single();
+    if (error || !data) throw new Error('Konverzaci se nepodařilo vytvořit.');
+    return data;
+  });
+
+const DeleteConversationInput = z.object({ conversationId: z.string().uuid() });
+
+export const deleteConversation = createServerFn({ method: 'POST' })
+  .middleware([requireSupabaseAuth])
+  .validator(DeleteConversationInput)
+  .handler(async ({ data, context }) => {
+    await context.supabase
+      .from('conversations')
+      .delete()
+      .eq('id', data.conversationId)
+      .eq('user_id', context.user.id);
+    return { success: true };
+  });
+
+const GetMessagesInput = z.object({ conversationId: z.string().uuid() });
+
+export const getMessages = createServerFn({ method: 'GET' })
+  .middleware([requireSupabaseAuth])
+  .validator(GetMessagesInput)
+  .handler(async ({ data, context }) => {
+    const { data: messages } = await context.supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', data.conversationId)
+      .order('created_at', { ascending: true });
+    return messages ?? [];
+  });
+
+const FeedbackInput = z.object({
+  messageId: z.string().uuid(),
+  rating: z.union([z.literal(1), z.literal(-1)]),
+});
+
+export const submitFeedback = createServerFn({ method: 'POST' })
+  .middleware([requireSupabaseAuth])
+  .validator(FeedbackInput)
+  .handler(async ({ data, context }) => {
+    await context.supabase
+      .from('message_feedback')
+      .upsert(
+        { message_id: data.messageId, user_id: context.user.id, rating: data.rating },
+        { onConflict: 'message_id,user_id' }
+      );
+    return { success: true };
+  });
+
+async function requireAdmin(supabase: any, userId: string) {
+  const { data: role } = await supabase
+    .from('user_roles')
+    .select('role')
+    .eq('user_id', userId)
+    .eq('role', 'hr_admin')
+    .maybeSingle();
+  if (!role) throw new Error('Nedostatečná oprávnění.');
+}
+
+export const adminListConversations = createServerFn({ method: 'GET' })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context.supabase, context.user.id);
+
+    const { data: conversations } = await context.supabase
+      .from('conversations')
+      .select('*, profiles:user_id(email)')
+      .order('created_at', { ascending: false });
+
+    const result = await Promise.all(
+      (conversations ?? []).map(async (c: any) => {
+        const { count } = await context.supabase
+          .from('messages')
+          .select('id', { count: 'exact', head: true })
+          .eq('conversation_id', c.id);
+        return {
+          id: c.id,
+          user_email: c.profiles?.email ?? '',
+          title: c.title,
+          message_count: count ?? 0,
+          created_at: c.created_at,
+        };
+      })
+    );
+
+    return result;
+  });
+
+export const getStats = createServerFn({ method: 'GET' })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context.supabase, context.user.id);
+    const { data } = await context.supabase.rpc('get_stats');
+    return data;
+  });
