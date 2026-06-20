@@ -7,6 +7,7 @@ import { ChatSidebar } from '../../components/ChatSidebar';
 import { ChatMessage } from '../../components/ChatMessage';
 import { LoadingDots } from '../../components/LoadingDots';
 import { EmptyState } from '../../components/EmptyState';
+import { WorkLogForm } from '../../components/WorkLogForm';
 
 export const Route = createFileRoute('/_authenticated/chat')({
   component: ChatPage,
@@ -122,6 +123,8 @@ function ChatPage() {
             </div>
           )}
         </div>
+
+        <WorkLogForm />
 
         <div className="border-t border-[var(--line)] p-4">
           <form

@@ -7,20 +7,21 @@ import type { ChunkMatch } from '../integrations/supabase/types';
 const SYSTEM_PROMPT = `Jsi Navigace — interní HR asistent firmy.
 
 PRAVIDLA:
-1. Odpovídej VÝHRADNĚ z poskytnutého kontextu z firemních dokumentů.
-2. Pokud odpověď není v kontextu, řekni: "Tuto informaci v dostupných dokumentech nenacházím."
+1. Odpovídej VÝHRADNĚ z poskytnutého kontextu (firemní dokumenty NEBO osobní/HR údaje níže).
+2. Pokud odpověď není v kontextu, řekni: "Tuto informaci nenacházím."
 3. Nikdy nevymýšlej fakta, čísla, data ani postupy.
 4. Odpovídej stručně a věcně v češtině.
-5. Vždy uveď, z jakého dokumentu čerpáš (dostaneš je v kontextu).
-6. Pokud je dotaz nesrozumitelný, požádej o upřesnění.
+5. U dokumentů vždy uveď zdroj (dostaneš ho v kontextu). U osobních/HR údajů zdroj uvádět nemusíš.
+6. Osobní a HR údaje v kontextu jsou už předfiltrované podle oprávnění tazatele — pokud tam někdo není uveden, nemáš o něm informace a neodpovídej na základě domněnek.
+7. Pokud je dotaz nesrozumitelný, požádej o upřesnění.
 
 FORMÁT:
 - Používej markdown (tučné písmo, seznamy) pro přehlednost.
-- Citace zdrojů jsou automaticky doplněny systémem, neuvádí je v textu odpovědi.`;
+- Citace zdrojů dokumentů jsou automaticky doplněny systémem, neuvádí je v textu odpovědi.`;
 
 function buildContextPrompt(chunks: ChunkMatch[]): string {
   if (chunks.length === 0) {
-    return '\n\n[KONTEXT: Žádné relevantní dokumenty nenalezeny.]';
+    return '';
   }
 
   const contextParts = chunks.map(
@@ -29,6 +30,88 @@ function buildContextPrompt(chunks: ChunkMatch[]): string {
   );
 
   return `\n\nKONTEXT Z FIREMNÍCH DOKUMENTŮ:\n${contextParts.join('\n\n---\n\n')}`;
+}
+
+function age(birthDate: string | null): number | null {
+  if (!birthDate) return null;
+  const ms = Date.now() - new Date(birthDate).getTime();
+  return Math.floor(ms / (1000 * 60 * 60 * 24 * 365.25));
+}
+
+async function fetchEmployeeBundle(supabase: any, targetUserId: string) {
+  const year = new Date().getFullYear();
+  const [profile, vacation, payslips, benefits, trips, logs] = await Promise.all([
+    supabase.from('employee_profiles').select('*').eq('user_id', targetUserId).maybeSingle(),
+    supabase.from('vacation_balances').select('*').eq('user_id', targetUserId).eq('year', year).maybeSingle(),
+    supabase.from('payslips').select('*').eq('user_id', targetUserId).order('issued_at', { ascending: false }).limit(1),
+    supabase.from('benefits').select('*').eq('user_id', targetUserId),
+    supabase.from('business_trips').select('*').eq('user_id', targetUserId).order('start_date', { ascending: false }).limit(3),
+    supabase.from('work_logs').select('*').eq('user_id', targetUserId).order('work_date', { ascending: false }).limit(5),
+  ]);
+
+  if (!profile.data) return null;
+
+  return {
+    profile: profile.data,
+    vacation: vacation.data,
+    payslip: payslips.data?.[0] ?? null,
+    benefits: benefits.data ?? [],
+    trips: trips.data ?? [],
+    logs: logs.data ?? [],
+  };
+}
+
+function formatEmployeeBundle(bundle: NonNullable<Awaited<ReturnType<typeof fetchEmployeeBundle>>>, label: string): string {
+  const p = bundle.profile;
+  const lines: string[] = [`${label}: ${p.first_name} ${p.last_name}`];
+  lines.push(`Pozice: ${p.position_title ?? '—'} (${p.department ?? '—'}${p.crew_name ? ', ' + p.crew_name : ''})`);
+  if (p.birth_date) lines.push(`Datum narození: ${p.birth_date} (věk: ${age(p.birth_date)} let)`);
+  if (p.phone) lines.push(`Telefon: ${p.phone}`);
+  if (p.personal_email) lines.push(`Osobní e-mail: ${p.personal_email}`);
+  if (p.address) lines.push(`Adresa: ${p.address}, ${p.city} ${p.postal_code}`);
+  if (p.hire_date) lines.push(`Nástup: ${p.hire_date} (${p.employment_type}, ${p.contract_type})`);
+
+  if (bundle.vacation) {
+    lines.push(`Dovolená ${bundle.vacation.year}: nárok ${bundle.vacation.days_entitled} dní, vyčerpáno ${bundle.vacation.days_used}, zbývá ${bundle.vacation.days_remaining}`);
+  }
+  if (bundle.payslip) {
+    lines.push(`Poslední výplata (${bundle.payslip.period}): hrubá mzda ${bundle.payslip.gross_salary} Kč, čistá ${bundle.payslip.net_salary} Kč`);
+  }
+  if (bundle.benefits.length > 0) {
+    lines.push(`Benefity: ${bundle.benefits.map((b: any) => b.value_czk ? `${b.name} (${b.value_czk} Kč)` : b.name).join(', ')}`);
+  }
+  if (bundle.trips.length > 0) {
+    lines.push(`Pracovní cesty: ${bundle.trips.map((t: any) => `${t.destination} (${t.start_date}–${t.end_date}, ${t.status})`).join('; ')}`);
+  }
+  if (bundle.logs.length > 0) {
+    lines.push(`Docházka (posledních dní): ${bundle.logs.map((l: any) => `${l.work_date} ${l.status}${l.hours ? ' ' + l.hours + 'h' : ''} – ${l.description}`).join('; ')}`);
+  }
+  return lines.join('\n');
+}
+
+async function buildEmployeeContextPrompt(supabase: any, userId: string, message: string): Promise<string> {
+  const own = await fetchEmployeeBundle(supabase, userId);
+  const parts: string[] = [];
+  if (own) parts.push(formatEmployeeBundle(own, 'MOJE OSOBNÍ A PRACOVNÍ ÚDAJE'));
+
+  const words = (message.match(/[A-Za-zÁ-Žá-ž]{3,}/g) ?? []).slice(0, 8);
+  if (words.length > 0) {
+    const orFilter = words.map(w => `first_name.ilike.%${w}%,last_name.ilike.%${w}%`).join(',');
+    const { data: matches } = await supabase
+      .from('employee_profiles')
+      .select('user_id')
+      .or(orFilter)
+      .neq('user_id', userId)
+      .limit(3);
+
+    for (const m of matches ?? []) {
+      const bundle = await fetchEmployeeBundle(supabase, m.user_id);
+      if (bundle) parts.push(formatEmployeeBundle(bundle, 'ÚDAJE O ZAMĚSTNANCI'));
+    }
+  }
+
+  if (parts.length === 0) return '';
+  return `\n\nOSOBNÍ A HR ÚDAJE (předfiltrované podle oprávnění tazatele):\n${parts.join('\n\n')}`;
 }
 
 const AskInput = z.object({
@@ -80,8 +163,9 @@ export const askAssistant = createServerFn({ method: 'POST' })
       .order('created_at', { ascending: true })
       .limit(20);
 
-    const contextStr = buildContextPrompt(chunks ?? []);
-    const fullSystem = SYSTEM_PROMPT + contextStr;
+    const docContextStr = buildContextPrompt(chunks ?? []);
+    const employeeContextStr = await buildEmployeeContextPrompt(supabase, userId, data.message);
+    const fullSystem = SYSTEM_PROMPT + docContextStr + employeeContextStr;
 
     let aiResponse: string;
     try {

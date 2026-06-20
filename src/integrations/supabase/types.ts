@@ -1,4 +1,4 @@
-export type AppRole = 'hr_admin' | 'employee';
+export type AppRole = 'hr_admin' | 'employee' | 'manazer' | 'mistr' | 'zamestnanec';
 
 export type DocumentStatus = 'processing' | 'ready' | 'error';
 
